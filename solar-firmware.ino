@@ -151,7 +151,7 @@ static const char*    NVS_KEY_CHARGED_WH      = "chargedWh";
 
 // ----- Battery monitoring (second INA219) -----
 static const uint8_t BATTERY_INA_ADDRESS              = 0x41;
-static const uint8_t BATTERY_CELLS                    = 2;
+static const uint8_t BATTERY_CELLS                    = 1;
 static const float   BATTERY_CURRENT_DEADBAND_MA      = 30.0f;
 static const bool    BATTERY_CHARGE_IS_POSITIVE_CURRENT = true;
 static const uint8_t BATTERY_FULL_PERCENT             = 98;
@@ -773,12 +773,13 @@ static void publishAck(const char* commandId,
                        const char* status,
                        const char* message = nullptr) {
   StaticJsonDocument<256> doc;
-  doc["commandId"] = commandId;
   doc["status"]    = status;
   if (message) doc["message"] = message;
   doc["current_h_angle"]  = state.horizontalAngle;
   doc["current_v_angle"]  = state.verticalAngle;
   doc["tracking_mode"]    = trackingModeStr(state.mode);
+  doc["commandId"] = commandId;
+  doc["device_id"] = MQTT_CLIENT_ID;
 
   char buf[256];
   const size_t len = serializeJson(doc, buf, sizeof(buf));
@@ -932,6 +933,8 @@ static void publishTelemetry() {
   doc["ldr_bottom_right"] = sensors.ldrBR;
   doc["horizontal_light_difference"] = sensors.hDiff;
   doc["vertical_light_difference"]   = sensors.vDiff;
+
+  doc["device_id"] = MQTT_CLIENT_ID;
 
   if (inaOk) {
     doc["solar_voltage"]         = sensors.solarV;
