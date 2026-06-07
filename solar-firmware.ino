@@ -36,6 +36,12 @@
  *       IDLE   -> stays IDLE, panel remains parked at HOME doing nothing.
  *     This preserves user intent across the night - if you chose MANUAL or
  *     IDLE in the afternoon, you keep that mode in the morning.
+ *   - TELEMETRY: while in NIGHT the telemetry cadence drops from the 1s
+ *     daytime rate to TELEMETRY_INTERVAL_NIGHT_MS (30s), since nothing is
+ *     tracking and the values barely change - this cuts WiFi/MQTT traffic and
+ *     radio power overnight. A REQUEST_STATUS command still forces an immediate
+ *     publish, and any manual command exits NIGHT, restoring the 1s cadence for
+ *     the duration of the manual-override window.
  *
  * OLED: dual-color SSD1306 0.96" (yellow top 16 rows + white bottom 48 rows,
  * colors fixed by the panel hardware). The normal screen uses the yellow band
@@ -68,17 +74,21 @@
 #include <time.h>
 #include <math.h>
 #include <sunset.h>
+#include "esp_task_wdt.h"
+#include "secrets.h"   // WiFi + MQTT credentials (NOT tracked in git)
 
 // =========================== Configuration ==================================
 
-static const char* WIFI_SSID     = "burjuc";
-static const char* WIFI_PASSWORD = "qkuvP2p4";
+// Credentials live in secrets.h (git-ignored). See secrets.h.example for the
+// expected structure. This keeps WiFi/MQTT secrets out of version control.
+static const char*    WIFI_SSID     = SECRET_WIFI_SSID;
+static const char*    WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
 
-static const char* MQTT_HOST      = "192.168.100.145";
-static const uint16_t MQTT_PORT   = 1883;
-static const char* MQTT_CLIENT_ID = "esp32-solar-01";
-static const char* MQTT_USERNAME  = "solar";
-static const char* MQTT_PASSWORD  = "burjucan01";
+static const char*    MQTT_HOST      = SECRET_MQTT_HOST;
+static const uint16_t MQTT_PORT      = SECRET_MQTT_PORT;
+static const char*    MQTT_CLIENT_ID = SECRET_MQTT_CLIENT_ID;
+static const char*    MQTT_USERNAME  = SECRET_MQTT_USERNAME;
+static const char*    MQTT_PASSWORD  = SECRET_MQTT_PASSWORD;
 
 static const char* TOPIC_TELEMETRY = "solar/telemetry";
 static const char* TOPIC_COMMANDS  = "solar/commands";
@@ -108,7 +118,13 @@ static const uint8_t V_HOME = 90;
 static const uint8_t V_SUNRISE = 30;
 
 static const uint16_t MIN_STEP_DELAY_MS     = 35;   // smoother manual sweep
-static const uint16_t TELEMETRY_INTERVAL_MS = 1000;
+
+// Telemetry cadence: 1s while active (AUTO/MANUAL/IDLE during the day), and a
+// reduced 30s rate while in NIGHT mode (nothing is tracking, values are static,
+// so we save WiFi/MQTT traffic and radio power overnight). REQUEST_STATUS still
+// forces an immediate publish regardless of cadence.
+static const uint16_t TELEMETRY_INTERVAL_MS       = 1000;
+static const uint32_t TELEMETRY_INTERVAL_NIGHT_MS = 30000;
 
 static const uint8_t LDR_SAMPLES = 8;
 
@@ -141,6 +157,15 @@ static const uint32_t LIGHT_RESTORE_MS     = 5000;
 
 // ----- OLED limit warning -----
 static const uint32_t LIMIT_WARNING_MS = 5000;
+
+// ----- Hardware watchdog -----
+// If loop() doesn't pet the WDT within this window, the chip reboots. The
+// system is unattended outdoor, so silent hangs (I2C stuck, library deadlock,
+// etc.) must self-recover. 30s is comfortably above the worst-case servo
+// settle from a coarse scan (~6s) and below any user's patience for a frozen
+// dashboard. WiFi/MQTT reconnect loops pet the WDT themselves so a missing
+// router doesn't cause a reboot storm.
+static const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
 
 // ----- Energy accumulation (Wh) -----
 static const uint32_t ENERGY_SAVE_INTERVAL_MS = 300000;
@@ -968,6 +993,7 @@ static void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) {
+    esp_task_wdt_reset();  // avoid WDT trip on slow router boot
     delay(500);
     Serial.print(".");
   }
@@ -993,6 +1019,7 @@ static void refreshTimeValid() {
 
 static void ensureMqtt() {
   while (!mqtt.connected()) {
+    esp_task_wdt_reset();  // avoid WDT trip while broker is offline
     Serial.print("[mqtt] connecting to ");
     Serial.print(MQTT_HOST); Serial.print(":"); Serial.println(MQTT_PORT);
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
@@ -1012,6 +1039,17 @@ static void ensureMqtt() {
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  // Hardware watchdog: must be petted within WATCHDOG_TIMEOUT_MS or the chip
+  // reboots. Configured before any blocking I/O so a stuck sensor init does
+  // not leave the firmware silently frozen.
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms     = WATCHDOG_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic  = true,
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);  // watch the loop() task
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -1073,6 +1111,8 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();  // pet the watchdog: "still alive"
+
   if (WiFi.status() != WL_CONNECTED) connectWifi();
   if (!mqtt.connected())            ensureMqtt();
   mqtt.loop();
@@ -1091,7 +1131,12 @@ void loop() {
 
   trackStep();
 
-  const bool intervalElapsed = (now - lastTelemetryMs) >= TELEMETRY_INTERVAL_MS;
+  // Telemetry cadence: 30s in NIGHT (idle, static values), 1s otherwise. A
+  // REQUEST_STATUS command (telemetryNowRequested) always publishes immediately,
+  // independent of the cadence.
+  const uint32_t telemetryInterval = isNight ? TELEMETRY_INTERVAL_NIGHT_MS
+                                             : TELEMETRY_INTERVAL_MS;
+  const bool intervalElapsed = (now - lastTelemetryMs) >= telemetryInterval;
   if (intervalElapsed || telemetryNowRequested) {
     lastTelemetryMs = now;
     telemetryNowRequested = false;

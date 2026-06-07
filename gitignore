@@ -1,0 +1,8 @@
+# Real credentials - never commit. Use secrets.h.example as the template.
+secrets.h
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.hex
