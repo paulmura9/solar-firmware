@@ -5,7 +5,7 @@ ESP32 firmware for LightTrack, a dual-axis solar tracking system developed as a 
 ## Hardware
 
 - ESP32 DevKit (WROOM-32)
-- 2x SG90 servos: azimuth on GPIO 18, elevation on GPIO 19
+- 1 SG90 + 1 MG995 servos: azimuth on GPIO 18, elevation on GPIO 19
 - 4x LDR sensors on ADC1 pins: top-left GPIO 32, top-right GPIO 35, bottom-left GPIO 34, bottom-right GPIO 33
 - 2x INA219 power monitors on I2C: solar panel at 0x40, battery at 0x41
 - SSD1306 0.96" OLED (dual-color) at 0x3C on the same I2C bus
