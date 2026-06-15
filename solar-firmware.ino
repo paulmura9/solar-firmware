@@ -137,9 +137,17 @@ static const uint16_t TRACK_INTERVAL_MS = 100;
 static const uint16_t SAMPLE_INTERVAL_MS = 200;
 
 // ----- Coarse scan -----
-static const uint8_t  SCAN_STEP        = 5;
-static const uint16_t SCAN_SETTLE_MS   = 90;    // calmer settle per scan position
-static const uint8_t  SCAN_LDR_SAMPLES = 4;
+// Larger step + longer settle = fewer / more spaced-out current spikes during
+// the H+V sweep, so the 5 V boost has time to recover between movements and
+// the ESP32 does not brown out mid-scan. Total scan time goes from ~6 s to
+// ~9 s, which is acceptable given it runs only on transition into AUTO or
+// after a long lost-sun. Fine tracking (trackStep) is unchanged, so steady-
+// state accuracy is not affected - the LDR-driven proportional control
+// corrects the few extra degrees of scan coarseness within a few ticks.
+static const uint8_t  SCAN_STEP            = 8;     // was 5; fewer points sampled
+static const uint16_t SCAN_SETTLE_MS       = 200;   // was 90; servo + boost recover
+static const uint16_t SCAN_INTER_AXIS_MS   = 500;   // pause between H and V sweeps
+static const uint8_t  SCAN_LDR_SAMPLES     = 4;
 
 // "Lost sun" fallback: after this many consecutive AUTO ticks below
 // DARK_THRESHOLD (~10s at TRACK_INTERVAL_MS=100), request a fresh sweep.
@@ -575,6 +583,11 @@ static void performScan() {
   servoAzimuth.write(bestH);
   state.horizontalAngle = bestH;
   delay(SCAN_SETTLE_MS);
+
+  // Inter-axis pause: the H sweep just discharged the 5 V rail with many quick
+  // servo writes. Wait a bit before kicking off the V sweep so the boost can
+  // recover full headroom and we avoid a brown-out reset between the two axes.
+  delay(SCAN_INTER_AXIS_MS);
 
   uint8_t bestV = state.verticalAngle;
   long    bestVLight = -1;
@@ -1073,15 +1086,23 @@ void setup() {
   }
 
   if (inaPanel.begin()) {
+    // Panel is small (~1-5W, max ~300mA). The default 32V/2A calibration has
+    // ~100 uA resolution per LSB - too coarse for our typical operating point
+    // (single-digit mA at indoor light) where the noise floor swamps the
+    // signal. 16V/400mA gives ~10 uA per LSB -> ~10x cleaner readings at low
+    // currents, while still covering the panel's full Voc (~12-20V) and Isc.
+    inaPanel.setCalibration_16V_400mA();
     inaOk = true;
-    Serial.println("[ina] panel OK");
+    Serial.println("[ina] panel OK (16V/400mA)");
   } else {
     Serial.println("[ina] panel FAIL");
   }
 
   if (inaBattery.begin()) {
+    // Battery rail sees servo stall currents (up to ~1.5 A combined), so we
+    // keep the default 32V/2A calibration to avoid clipping during transients.
     inaBatteryOk = true;
-    Serial.printf("[ina] battery OK (0x%02X)\n", BATTERY_INA_ADDRESS);
+    Serial.printf("[ina] battery OK (0x%02X, 32V/2A)\n", BATTERY_INA_ADDRESS);
   } else {
     Serial.printf("[ina] battery FAIL (no device at 0x%02X)\n", BATTERY_INA_ADDRESS);
   }
