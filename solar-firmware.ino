@@ -43,6 +43,15 @@
  *     publish, and any manual command exits NIGHT, restoring the 1s cadence for
  *     the duration of the manual-override window.
  *
+ * Error policy:
+ *   - ERROR is entered only on a catastrophic I2C bus failure at boot (no INA219
+ *     and no OLED answering at all). Tracking itself uses ADC (LDRs) + PWM
+ *     (servos) and does not need I2C, but with the whole sensing/display bus
+ *     dead the system cannot monitor anything, so it refuses to run unattended.
+ *   - A SINGLE missing I2C device is NOT an error: it is handled by graceful
+ *     degradation (its fields are omitted from telemetry).
+ *   - ERROR is sticky: recovery is by reboot after fixing the wiring.
+ *
  * OLED: dual-color SSD1306 0.96" (yellow top 16 rows + white bottom 48 rows,
  * colors fixed by the panel hardware). The normal screen uses the yellow band
  * for the "-- PANEL --" header and the white band for V/I/P. When the panel
@@ -79,8 +88,6 @@
 
 // =========================== Configuration ==================================
 
-// Credentials live in secrets.h (git-ignored). See secrets.h.example for the
-// expected structure. This keeps WiFi/MQTT secrets out of version control.
 static const char*    WIFI_SSID     = SECRET_WIFI_SSID;
 static const char*    WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
 
@@ -130,24 +137,21 @@ static const uint8_t LDR_SAMPLES = 8;
 
 // ----- Tracking tuning (gentler still - peak ~20°/s in AUTO) -----
 static const int      LDR_DEADBAND      = 350;
-static const int      DARK_THRESHOLD    = 500;
+static const int      DARK_THRESHOLD    = 450;   // avg LDR below this -> no tracking/scan
 static const uint8_t  MAX_TRACK_STEP    = 2;     // max degrees per tracking tick
 static const int      PROP_STEP_DIVISOR = 1000;  // larger -> gentler ramp to max
 static const uint16_t TRACK_INTERVAL_MS = 100;
 static const uint16_t SAMPLE_INTERVAL_MS = 200;
 
 // ----- Coarse scan -----
-// Larger step + longer settle = fewer / more spaced-out current spikes during
-// the H+V sweep, so the 5 V boost has time to recover between movements and
-// the ESP32 does not brown out mid-scan. Total scan time goes from ~6 s to
-// ~9 s, which is acceptable given it runs only on transition into AUTO or
-// after a long lost-sun. Fine tracking (trackStep) is unchanged, so steady-
-// state accuracy is not affected - the LDR-driven proportional control
-// corrects the few extra degrees of scan coarseness within a few ticks.
-static const uint8_t  SCAN_STEP            = 8;     // was 5; fewer points sampled
-static const uint16_t SCAN_SETTLE_MS       = 200;   // was 90; servo + boost recover
-static const uint16_t SCAN_INTER_AXIS_MS   = 500;   // pause between H and V sweeps
-static const uint8_t  SCAN_LDR_SAMPLES     = 4;
+// 5° step + 90 ms settle: a smooth, near-continuous sweep (the 8°/200 ms
+// variant moved in big jerky steps and strained the servos). The scan takes
+// ~6-7 s but pets the watchdog itself (see performScan), so its blocking
+// duration does not trip the WDT. Fine tracking (trackStep) corrects the small
+// scan coarseness within a few ticks.
+static const uint8_t  SCAN_STEP        = 5;
+static const uint16_t SCAN_SETTLE_MS   = 90;
+static const uint8_t  SCAN_LDR_SAMPLES = 4;
 
 // "Lost sun" fallback: after this many consecutive AUTO ticks below
 // DARK_THRESHOLD (~10s at TRACK_INTERVAL_MS=100), request a fresh sweep.
@@ -169,8 +173,8 @@ static const uint32_t LIMIT_WARNING_MS = 5000;
 // ----- Hardware watchdog -----
 // If loop() doesn't pet the WDT within this window, the chip reboots. The
 // system is unattended outdoor, so silent hangs (I2C stuck, library deadlock,
-// etc.) must self-recover. 30s is comfortably above the worst-case servo
-// settle from a coarse scan (~6s) and below any user's patience for a frozen
+// etc.) must self-recover. 30s is comfortably above the coarse scan (~6-7s,
+// which also pets the WDT itself) and below any user's patience for a frozen
 // dashboard. WiFi/MQTT reconnect loops pet the WDT themselves so a missing
 // router doesn't cause a reboot storm.
 static const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
@@ -454,13 +458,6 @@ static bool isAstronomicalNight() {
 
 // =========================== Sunrise azimuth math ===========================
 
-// Sunrise azimuth in compass degrees (0=N, 90=E, 180=S, 270=W) for the
-// observer latitude and current day-of-year. Uses the standard horizon
-// astronomy identity:
-//     cos(A_sunrise) = sin(declination) / cos(latitude)
-// with declination approximated as 23.45° * sin(2π * (doy - 81) / 365).
-// Accurate to ~1°, which is well within the panel's mechanical resolution.
-// Returns 90° (due East) if time is not yet synced.
 static double sunriseAzimuthDeg() {
   if (!timeValid) return 90.0;
 
@@ -479,19 +476,11 @@ static double sunriseAzimuthDeg() {
   return acos(cosA) * 180.0 / PI_D;  // 0..180, measured from North
 }
 
-// Map a compass-cardinal azimuth (0..360 from N) to the servo H angle. The
-// panel arc covers E (cardinal 90) -> S (cardinal 180) -> W (cardinal 270),
-// so servo = cardinal - 90. Out-of-range targets (NE before solar east,
-// NW after solar west) clamp to H_MIN / H_MAX - the LDR will catch the sun
-// once it crosses into the reachable range.
 static uint8_t cardinalToServoH(double cardinalDeg) {
   const int servo = static_cast<int>(cardinalDeg + 0.5) - 90;
   return clampAngle(servo, H_MIN, H_MAX);
 }
 
-// Pre-aim the panel toward today's sunrise direction. Skips the coarse
-// scan because the math already gives us the answer, with less servo wear
-// and a faster handoff to LDR fine-tracking.
 static void preAimAtSunrise() {
   const double azNorth = sunriseAzimuthDeg();
   const uint8_t targetH = cardinalToServoH(azNorth);
@@ -577,29 +566,28 @@ static void performScan() {
   for (int h = H_MIN; h <= H_MAX; h += SCAN_STEP) {
     servoAzimuth.write(h);
     delay(SCAN_SETTLE_MS);
+    esp_task_wdt_reset();              // pet WDT during the blocking sweep
     const long light = readTotalLight();
     if (light > bestHLight) { bestHLight = light; bestH = h; }
   }
   servoAzimuth.write(bestH);
   state.horizontalAngle = bestH;
   delay(SCAN_SETTLE_MS);
-
-  // Inter-axis pause: the H sweep just discharged the 5 V rail with many quick
-  // servo writes. Wait a bit before kicking off the V sweep so the boost can
-  // recover full headroom and we avoid a brown-out reset between the two axes.
-  delay(SCAN_INTER_AXIS_MS);
+  esp_task_wdt_reset();
 
   uint8_t bestV = state.verticalAngle;
   long    bestVLight = -1;
   for (int v = V_MIN; v <= V_MAX; v += SCAN_STEP) {
     servoElevation.write(v);
     delay(SCAN_SETTLE_MS);
+    esp_task_wdt_reset();              // pet WDT during the blocking sweep
     const long light = readTotalLight();
     if (light > bestVLight) { bestVLight = light; bestV = v; }
   }
   servoElevation.write(bestV);
   state.verticalAngle = bestV;
   delay(SCAN_SETTLE_MS);
+  esp_task_wdt_reset();
 
   Serial.print("[scan] best H="); Serial.print(bestH);
   Serial.print(" V="); Serial.println(bestV);
@@ -608,6 +596,8 @@ static void performScan() {
 // =========================== Low-light state machine ========================
 
 static void updateLowLight() {
+  if (state.mode == TrackingMode::ERROR) return;   // [ERROR] sticky until reboot
+
   const uint32_t now = millis();
   const bool lowLight = isLowLightMajority();
   const bool overrideActive = (now < manualOverrideUntilMs);
@@ -617,12 +607,6 @@ static void updateLowLight() {
       if (lightOkSinceMs == 0) lightOkSinceMs = now;
       if (now - lightOkSinceMs >= LIGHT_RESTORE_MS) {
         // Morning wake: restore the mode that was active before night.
-        //   AUTO   -> stays AUTO, pre-aim at sunrise so LDR fine-tune picks
-        //             up the rising sun immediately.
-        //   MANUAL -> stays MANUAL, panel remains at HOME until the user
-        //             sends a new MOVE_PANEL command.
-        //   IDLE   -> stays IDLE, panel remains parked at HOME.
-        // This preserves user intent across the night.
         isNight = false;
         state.mode = modeBeforeNight;
         scanRequested = false;
@@ -688,11 +672,6 @@ static void trackStep() {
   lastTrackMs = now;
 
   if (averageLight() < DARK_THRESHOLD) {
-    // Lost-sun fallback: panel is in the dark while AUTO is on. Only
-    // re-scan if it's DAY - at astronomical night there's no sun to find
-    // below the horizon, and scanning would just chew through servo cycles.
-    // updateLowLight() will eventually transition us out of AUTO into NIGHT
-    // once the manual override (if any) expires.
     if (!isAstronomicalNight() && ++lostSunTicks >= LOST_SUN_TICKS) {
       lostSunTicks = 0;
       scanRequested = true;
@@ -730,25 +709,15 @@ static void trackStep() {
 }
 
 // =========================== OLED ===========================================
-//
-// Dual-color 0.96" SSD1306: top 16 pixel rows render YELLOW, the remaining
-// 48 rows render WHITE. The color is fixed by the panel hardware, not by
-// software. We use that as a free 2-band layout:
-//   - top 16px (yellow): headline ("-- PANEL --" or "!! WARNING !!")
-//   - bottom 48px (white): values or warning details
-// No drawBox / setDrawColor inversion - text is drawn directly on the
-// transparent background so the hardware color shows through.
 
 static void oledShow() {
   if (!oledOk) return;
   oled.clearBuffer();
 
   if (millis() < limitWarningUntilMs) {
-    // Yellow band on top: alert headline.
     oled.setFont(u8g2_font_ncenB10_tr);
     oled.drawStr(8, 13, "!! WARNING !!");
 
-    // White band below: which axis hit the limit + a small footer.
     oled.setFont(u8g2_font_ncenB12_tr);
     oled.drawStr(4, 40, limitWarningText);
     oled.setFont(u8g2_font_6x10_tr);
@@ -758,11 +727,9 @@ static void oledShow() {
     return;
   }
 
-  // Yellow header: stylized "-- PANEL --" without any frame/box.
   oled.setFont(u8g2_font_ncenB12_tr);
   oled.drawStr(22, 13, "-- PANEL --");
 
-  // White values below.
   oled.setFont(u8g2_font_ncenB10_tr);
   char buffer[20];
   snprintf(buffer, sizeof(buffer), "V: %.2f V",  sensors.solarV);
@@ -799,6 +766,7 @@ static void moveTo(uint8_t targetH, uint8_t targetV) {
       servoElevation.write(state.verticalAngle);
     }
     delay(MIN_STEP_DELAY_MS);
+    esp_task_wdt_reset();   // pet WDT during long manual sweeps
   }
 
   state.isMoving = false;
@@ -919,6 +887,13 @@ static void handleCommand(const JsonDocument& doc) {
   }
   if (commandType[0] == '\0') {
     publishAck(commandId, "FAILED", "missing command_type");
+    return;
+  }
+
+  // [ERROR] In ERROR the device refuses everything except a status query.
+  if (state.mode == TrackingMode::ERROR &&
+      strcmp(commandType, "REQUEST_STATUS") != 0) {
+    publishAck(commandId, "FAILED", "device in ERROR (I2C unavailable)");
     return;
   }
 
@@ -1053,16 +1028,25 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // Hardware watchdog: must be petted within WATCHDOG_TIMEOUT_MS or the chip
-  // reboots. Configured before any blocking I/O so a stuck sensor init does
-  // not leave the firmware silently frozen.
+  // Report why we last reset (BROWNOUT vs WATCHDOG vs PANIC) - useful for
+  // field debugging power vs firmware issues.
+  esp_reset_reason_t rr = esp_reset_reason();
+  Serial.printf("[boot] reset reason = %s\n",
+    rr == ESP_RST_BROWNOUT ? "BROWNOUT" :
+    (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT) ? "WATCHDOG" :
+    rr == ESP_RST_PANIC ? "PANIC/CRASH" : "other");
+
+  // Hardware watchdog: the Arduino core already starts a Task WDT on loopTask,
+  // so esp_task_wdt_init() would fail with "already initialized". We reconfigure
+  // it to our timeout instead. Long blocking ops (performScan, moveTo, WiFi/MQTT
+  // reconnect) pet the WDT themselves so they don't trip it.
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms     = WATCHDOG_TIMEOUT_MS,
     .idle_core_mask = 0,
     .trigger_panic  = true,
   };
-  esp_task_wdt_init(&wdt_config);
-  esp_task_wdt_add(NULL);  // watch the loop() task
+  esp_task_wdt_reconfigure(&wdt_config);  // apply our 30s window to the core's TWDT
+  esp_task_wdt_add(NULL);                 // ensure loopTask is watched (no-op if already)
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -1086,11 +1070,9 @@ void setup() {
   }
 
   if (inaPanel.begin()) {
-    // Panel is small (~1-5W, max ~300mA). The default 32V/2A calibration has
-    // ~100 uA resolution per LSB - too coarse for our typical operating point
-    // (single-digit mA at indoor light) where the noise floor swamps the
-    // signal. 16V/400mA gives ~10 uA per LSB -> ~10x cleaner readings at low
-    // currents, while still covering the panel's full Voc (~12-20V) and Isc.
+    // Panel is small (~1-5W, max ~300mA). 16V/400mA gives ~10 uA per LSB ->
+    // ~10x cleaner readings at low currents than the default 32V/2A, while
+    // still covering the panel's full Voc and Isc.
     inaPanel.setCalibration_16V_400mA();
     inaOk = true;
     Serial.println("[ina] panel OK (16V/400mA)");
@@ -1099,12 +1081,22 @@ void setup() {
   }
 
   if (inaBattery.begin()) {
-    // Battery rail sees servo stall currents (up to ~1.5 A combined), so we
-    // keep the default 32V/2A calibration to avoid clipping during transients.
+    // Battery rail sees servo stall currents, so keep the default 32V/2A
+    // calibration to avoid clipping during transients.
     inaBatteryOk = true;
     Serial.printf("[ina] battery OK (0x%02X, 32V/2A)\n", BATTERY_INA_ADDRESS);
   } else {
     Serial.printf("[ina] battery FAIL (no device at 0x%02X)\n", BATTERY_INA_ADDRESS);
+  }
+
+  // [ERROR] Catastrophic I2C bus failure: if NOT A SINGLE I2C device answered
+  // (both INA219 and the OLED), the bus is dead/unwired - nothing to measure,
+  // nothing to show. Enter the reserved ERROR state and refuse to run
+  // unattended. A SINGLE missing device is handled by graceful degradation
+  // (its fields are simply omitted from telemetry), not by ERROR.
+  if (!inaOk && !inaBatteryOk && !oledOk) {
+    state.mode = TrackingMode::ERROR;
+    Serial.println("[boot] I2C bus dead (no devices) -> ERROR");
   }
 
   loadEnergyFromNvs();
@@ -1152,9 +1144,6 @@ void loop() {
 
   trackStep();
 
-  // Telemetry cadence: 30s in NIGHT (idle, static values), 1s otherwise. A
-  // REQUEST_STATUS command (telemetryNowRequested) always publishes immediately,
-  // independent of the cadence.
   const uint32_t telemetryInterval = isNight ? TELEMETRY_INTERVAL_NIGHT_MS
                                              : TELEMETRY_INTERVAL_MS;
   const bool intervalElapsed = (now - lastTelemetryMs) >= telemetryInterval;
