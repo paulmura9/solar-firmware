@@ -70,9 +70,11 @@
  * Dependencies (Arduino IDE):
  *   ESP32 board package, ESP32Servo, PubSubClient, ArduinoJson 7.x,
  *   Adafruit INA219, U8g2, SunSet (buelowp) -> #include <sunset.h>, Preferences.
+ *   (WiFiMulti ships with the ESP32 core - no extra install.)
  */
 
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <ESP32Servo.h>
@@ -137,21 +139,33 @@ static const uint8_t LDR_SAMPLES = 8;
 
 // ----- Tracking tuning (gentler still - peak ~20°/s in AUTO) -----
 static const int      LDR_DEADBAND      = 350;
-static const int      DARK_THRESHOLD    = 450;   // avg LDR below this -> no tracking/scan
+static const int      DARK_THRESHOLD    = 400;   // avg LDR below this -> no tracking/scan
 static const uint8_t  MAX_TRACK_STEP    = 2;     // max degrees per tracking tick
-static const int      PROP_STEP_DIVISOR = 1000;  // larger -> gentler ramp to max
-static const uint16_t TRACK_INTERVAL_MS = 100;
-static const uint16_t SAMPLE_INTERVAL_MS = 200;
+static const int      PROP_STEP_DIVISOR = 500;  // larger -> gentler ramp to max
+static const uint16_t TRACK_INTERVAL_MS = 50;
+static const uint16_t SAMPLE_INTERVAL_MS = 100;
 
 // ----- Coarse scan -----
 // 5° step + 90 ms settle: a smooth, near-continuous sweep (the 8°/200 ms
-// variant moved in big jerky steps and strained the servos). The scan takes
-// ~6-7 s but pets the watchdog itself (see performScan), so its blocking
-// duration does not trip the WDT. Fine tracking (trackStep) corrects the small
-// scan coarseness within a few ticks.
+// variant moved in big jerky steps and strained the servos). The scan runs as
+// coordinate descent (sweep azimuth, then elevation, repeated up to
+// SCAN_MAX_ROUNDS): one pass per axis cannot find the joint optimum of a point
+// source because the best azimuth depends on the current elevation and
+// vice-versa - a single azimuth-then-elevation sweep tends to slam elevation to
+// the limit. Each round is ~6-7 s, it stops early once a round changes nothing,
+// and it pets the watchdog itself (see sweepAxis), so its blocking duration does
+// not trip the WDT. Fine tracking (trackStep) corrects the small scan coarseness
+// within a few ticks.
 static const uint8_t  SCAN_STEP        = 5;
 static const uint16_t SCAN_SETTLE_MS   = 90;
 static const uint8_t  SCAN_LDR_SAMPLES = 4;
+// Coordinate-descent rounds (azimuth + elevation) before giving up; stops early
+// on convergence. One pass per axis is not enough for a point source.
+static const uint8_t  SCAN_MAX_ROUNDS  = 3;
+// In AUTO, stay this many degrees inside the hard limits so the scan and the
+// steady-state tracking never park exactly on 5°/175° and fire the limit warning
+// every cycle. Manual moves still use the full H_MIN..H_MAX range.
+static const uint8_t  AUTO_MARGIN_DEG  = 1;
 
 // "Lost sun" fallback: after this many consecutive AUTO ticks below
 // DARK_THRESHOLD (~10s at TRACK_INTERVAL_MS=100), request a fresh sweep.
@@ -173,10 +187,11 @@ static const uint32_t LIMIT_WARNING_MS = 5000;
 // ----- Hardware watchdog -----
 // If loop() doesn't pet the WDT within this window, the chip reboots. The
 // system is unattended outdoor, so silent hangs (I2C stuck, library deadlock,
-// etc.) must self-recover. 30s is comfortably above the coarse scan (~6-7s,
-// which also pets the WDT itself) and below any user's patience for a frozen
-// dashboard. WiFi/MQTT reconnect loops pet the WDT themselves so a missing
-// router doesn't cause a reboot storm.
+// etc.) must self-recover. 30s is far longer than the gap between watchdog pets
+// inside any blocking op (the coarse scan and manual sweeps pet the WDT every
+// step), and below any user's patience for a frozen dashboard. WiFi/MQTT
+// reconnect loops pet the WDT themselves so a missing router doesn't cause a
+// reboot storm.
 static const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
 
 // ----- Energy accumulation (Wh) -----
@@ -190,7 +205,7 @@ static const char*    NVS_KEY_CHARGED_WH      = "chargedWh";
 static const uint8_t BATTERY_INA_ADDRESS              = 0x41;
 static const uint8_t BATTERY_CELLS                    = 1;
 static const float   BATTERY_CURRENT_DEADBAND_MA      = 30.0f;
-static const bool    BATTERY_CHARGE_IS_POSITIVE_CURRENT = true;
+static const bool    BATTERY_CHARGE_IS_POSITIVE_CURRENT = false;
 static const uint8_t BATTERY_FULL_PERCENT             = 98;
 
 struct BatteryPoint { float cellVoltage; uint8_t percent; };
@@ -237,6 +252,7 @@ static bool parseTrackingMode(const char* s, TrackingMode& out) {
 
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
+WiFiMulti    wifiMulti;   // holds all known networks; picks the best available
 
 Servo servoAzimuth;
 Servo servoElevation;
@@ -312,6 +328,7 @@ static char     limitWarningText[24] = "";
 static void moveTo(uint8_t targetH, uint8_t targetV);
 static void preAimAtSunrise();
 static bool isAstronomicalNight();
+static void publishTelemetry();   // used by the scan to stream the moving panel
 
 // =========================== Helpers ========================================
 
@@ -558,36 +575,73 @@ static long readTotalLight() {
   return total / SCAN_LDR_SAMPLES;
 }
 
+// Sweep one axis over [lo, hi] in SCAN_STEP steps (the other axis is left where
+// it is) and return the angle with the most total light. The panel does NOT
+// stop when it passes the brightest spot - it sweeps the whole range so it finds
+// the GLOBAL maximum (not the first local peak / a reflection), and the caller
+// writes the servo back to that best angle afterwards. Pets the WDT every step
+// so a multi-round scan cannot trip the 30s watchdog. While sweeping it reflects
+// the live angle into `liveAngle` and streams throttled telemetry (~5x/s) so the
+// dashboard shows the mode and the panel moving DURING the scan, not only after.
+static uint8_t sweepAxis(Servo& servo, uint8_t& liveAngle, int lo, int hi) {
+  uint8_t best = static_cast<uint8_t>(lo);
+  long bestLight = -1;
+  static uint32_t lastScanPubMs = 0;
+  for (int a = lo; a <= hi; a += SCAN_STEP) {
+    servo.write(a);
+    liveAngle = static_cast<uint8_t>(a);    // reflect the moving panel in telemetry
+    delay(SCAN_SETTLE_MS);
+    esp_task_wdt_reset();
+    mqtt.loop();                            // keep MQTT alive during the long scan
+    const uint32_t pubNow = millis();
+    if (pubNow - lastScanPubMs >= 200) {    // stream ~5x/s, not on every step
+      lastScanPubMs = pubNow;
+      publishTelemetry();
+    }
+    const long light = readTotalLight();
+    if (light > bestLight) { bestLight = light; best = static_cast<uint8_t>(a); }
+  }
+  return best;
+}
+
 static void performScan() {
   Serial.println("[scan] start");
 
-  uint8_t bestH = state.horizontalAngle;
-  long    bestHLight = -1;
-  for (int h = H_MIN; h <= H_MAX; h += SCAN_STEP) {
-    servoAzimuth.write(h);
-    delay(SCAN_SETTLE_MS);
-    esp_task_wdt_reset();              // pet WDT during the blocking sweep
-    const long light = readTotalLight();
-    if (light > bestHLight) { bestHLight = light; bestH = h; }
-  }
-  servoAzimuth.write(bestH);
-  state.horizontalAngle = bestH;
-  delay(SCAN_SETTLE_MS);
-  esp_task_wdt_reset();
+  const int hLo = H_MIN + AUTO_MARGIN_DEG, hHi = H_MAX - AUTO_MARGIN_DEG;
+  const int vLo = V_MIN + AUTO_MARGIN_DEG, vHi = V_MAX - AUTO_MARGIN_DEG;
 
-  uint8_t bestV = state.verticalAngle;
-  long    bestVLight = -1;
-  for (int v = V_MIN; v <= V_MAX; v += SCAN_STEP) {
-    servoElevation.write(v);
+  uint8_t bestH = clampAngle(state.horizontalAngle, hLo, hHi);
+  uint8_t bestV = clampAngle(state.verticalAngle, vLo, vHi);
+
+  // Coordinate descent: alternately optimise azimuth and elevation until neither
+  // axis moves (the joint maximum) or we run out of rounds. One pass per axis
+  // lands on the wrong spot for a point source because the axes are coupled - the
+  // best azimuth depends on the current elevation and vice-versa, which is why a
+  // single azimuth-then-elevation sweep tends to slam elevation to the limit.
+  // state.horizontalAngle / state.verticalAngle are passed as the live angle so
+  // the streamed telemetry follows the panel during the sweep.
+  for (uint8_t round = 0; round < SCAN_MAX_ROUNDS; round++) {
+    servoElevation.write(bestV);
+    state.verticalAngle = bestV;
     delay(SCAN_SETTLE_MS);
-    esp_task_wdt_reset();              // pet WDT during the blocking sweep
-    const long light = readTotalLight();
-    if (light > bestVLight) { bestVLight = light; bestV = v; }
+    const uint8_t newH = sweepAxis(servoAzimuth, state.horizontalAngle, hLo, hHi);
+
+    servoAzimuth.write(newH);
+    state.horizontalAngle = newH;
+    delay(SCAN_SETTLE_MS);
+    const uint8_t newV = sweepAxis(servoElevation, state.verticalAngle, vLo, vHi);
+
+    const bool converged = (newH == bestH && newV == bestV);
+    bestH = newH;
+    bestV = newV;
+    if (converged) break;
   }
+
+  servoAzimuth.write(bestH);
   servoElevation.write(bestV);
+  state.horizontalAngle = bestH;
   state.verticalAngle = bestV;
   delay(SCAN_SETTLE_MS);
-  esp_task_wdt_reset();
 
   Serial.print("[scan] best H="); Serial.print(bestH);
   Serial.print(" V="); Serial.println(bestV);
@@ -658,8 +712,10 @@ static void trackStep() {
     if (averageLight() >= DARK_THRESHOLD) {
       scanRequested = false;
       state.isMoving = true;
+      publishTelemetry();   // push mode=AUTO + isMoving instantly, before the long scan
       performScan();
       state.isMoving = false;
+      publishTelemetry();   // show the final settled position immediately
       lastTrackMs = millis();
       lostSunTicks = 0;
       checkAxisLimits();
@@ -689,7 +745,7 @@ static void trackStep() {
     const int wantH = (sensors.hDiff > 0)
       ? static_cast<int>(state.horizontalAngle) + stepH
       : static_cast<int>(state.horizontalAngle) - stepH;
-    newH = clampAngle(wantH, H_MIN, H_MAX);
+    newH = clampAngle(wantH, H_MIN + AUTO_MARGIN_DEG, H_MAX - AUTO_MARGIN_DEG);
   }
 
   const uint8_t stepV = proportionalStep(sensors.vDiff);
@@ -697,7 +753,7 @@ static void trackStep() {
     const int wantV = (sensors.vDiff > 0)
       ? static_cast<int>(state.verticalAngle) + stepV
       : static_cast<int>(state.verticalAngle) - stepV;
-    newV = clampAngle(wantV, V_MIN, V_MAX);
+    newV = clampAngle(wantV, V_MIN + AUTO_MARGIN_DEG, V_MAX - AUTO_MARGIN_DEG);
   }
 
   const bool moved = (newH != state.horizontalAngle) || (newV != state.verticalAngle);
@@ -934,7 +990,7 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
 // =========================== Telemetry ======================================
 
 static void publishTelemetry() {
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   doc["horizontal_angle"] = state.horizontalAngle;
   doc["vertical_angle"]   = state.verticalAngle;
   doc["tracking_mode"]    = trackingModeStr(state.mode);
@@ -968,25 +1024,28 @@ static void publishTelemetry() {
     }
   }
 
-  char buf[512];
+  char buf[768];
   const size_t n = serializeJson(doc, buf, sizeof(buf));
   mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<uint8_t*>(buf), n, false);
 }
 
 // =========================== Connection / time ==============================
 
+// Multi-AP WiFi: tries every registered network (home + hotspot) and joins the
+// known one with the strongest signal that is currently in range. If the active
+// AP later disappears, loop() calls this again and it fails over to the other.
+// addAP() registration happens once in setup(), not here, so reconnects don't
+// pile up duplicate entries.
 static void connectWifi() {
-  Serial.print("[wifi] connecting to ");
-  Serial.println(WIFI_SSID);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    esp_task_wdt_reset();  // avoid WDT trip on slow router boot
+  Serial.println("[wifi] connecting (multi-AP)...");
+  while (wifiMulti.run() != WL_CONNECTED) {
+    esp_task_wdt_reset();  // avoid WDT trip while scanning/joining
     delay(500);
     Serial.print(".");
   }
-  Serial.print("\n[wifi] connected, ip=");
-  Serial.println(WiFi.localIP());
+  Serial.printf("\n[wifi] connected to \"%s\", ip=%s, rssi=%d dBm\n",
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
 }
 
 static void startTimeSync() {
@@ -1113,6 +1172,14 @@ void setup() {
   delay(500);
 
   sun.setPosition(LOCATION_LAT, LOCATION_LON, 2);
+
+  // Register every known network ONCE. wifiMulti then joins whichever is in
+  // range with the best signal. The second AP (hotspot) is optional: if it's
+  // not defined in secrets.h the firmware still builds and uses only the first.
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+#ifdef SECRET_WIFI_SSID_2
+  wifiMulti.addAP(SECRET_WIFI_SSID_2, SECRET_WIFI_PASSWORD_2);
+#endif
 
   connectWifi();
   startTimeSync();
