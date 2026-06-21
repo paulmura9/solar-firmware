@@ -71,6 +71,10 @@
  *   ESP32 board package, ESP32Servo, PubSubClient, ArduinoJson 7.x,
  *   Adafruit INA219, U8g2, SunSet (buelowp) -> #include <sunset.h>, Preferences.
  *   (WiFiMulti ships with the ESP32 core - no extra install.)
+ *
+ * MQTT broker: the Pi has a different IP per network (home vs hotspot). Define
+ * SECRET_MQTT_HOST and SECRET_MQTT_HOST_2 in secrets.h; the ESP tries each in
+ * turn until one connects (see ensureMqtt).
  */
 
 #include <WiFi.h>
@@ -93,11 +97,22 @@
 static const char*    WIFI_SSID     = SECRET_WIFI_SSID;
 static const char*    WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
 
-static const char*    MQTT_HOST      = SECRET_MQTT_HOST;
 static const uint16_t MQTT_PORT      = SECRET_MQTT_PORT;
 static const char*    MQTT_CLIENT_ID = SECRET_MQTT_CLIENT_ID;
 static const char*    MQTT_USERNAME  = SECRET_MQTT_USERNAME;
 static const char*    MQTT_PASSWORD  = SECRET_MQTT_PASSWORD;
+
+// MQTT broker candidates. The Pi gets a different IP on each network (home vs
+// hotspot), so the ESP tries each in turn until one connects. The second host
+// is optional: if SECRET_MQTT_HOST_2 is not defined in secrets.h, only the
+// first is used and the firmware still builds.
+static const char* MQTT_HOSTS[] = {
+  SECRET_MQTT_HOST,
+#ifdef SECRET_MQTT_HOST_2
+  SECRET_MQTT_HOST_2,
+#endif
+};
+static const size_t MQTT_HOST_COUNT = sizeof(MQTT_HOSTS) / sizeof(MQTT_HOSTS[0]);
 
 static const char* TOPIC_TELEMETRY = "solar/telemetry";
 static const char* TOPIC_COMMANDS  = "solar/commands";
@@ -1064,18 +1079,23 @@ static void refreshTimeValid() {
   }
 }
 
+// Try each broker in MQTT_HOSTS in turn until one connects. The Pi has a
+// different IP per network (home vs hotspot), so alternating between the known
+// IPs lets the ESP find the broker on whichever network it joined. hostIdx is
+// static so a later reconnect keeps trying from where it left off.
 static void ensureMqtt() {
+  static size_t hostIdx = 0;
   while (!mqtt.connected()) {
     esp_task_wdt_reset();  // avoid WDT trip while broker is offline
-    Serial.print("[mqtt] connecting to ");
-    Serial.print(MQTT_HOST); Serial.print(":"); Serial.println(MQTT_PORT);
+    const char* host = MQTT_HOSTS[hostIdx];
+    mqtt.setServer(host, MQTT_PORT);
+    Serial.printf("[mqtt] connecting to %s:%u\n", host, MQTT_PORT);
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
-      Serial.println("[mqtt] connected");
+      Serial.printf("[mqtt] connected to %s\n", host);
       mqtt.subscribe(TOPIC_COMMANDS, 1);
     } else {
-      Serial.print("[mqtt] failed, rc=");
-      Serial.print(mqtt.state());
-      Serial.println(", retrying in 2s");
+      Serial.printf("[mqtt] failed (rc=%d), trying next broker in 2s\n", mqtt.state());
+      hostIdx = (hostIdx + 1) % MQTT_HOST_COUNT;  // alternate home <-> hotspot
       delay(2000);
     }
   }
@@ -1184,7 +1204,8 @@ void setup() {
   connectWifi();
   startTimeSync();
 
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  // The broker host is selected per-attempt inside ensureMqtt() (it cycles
+  // through MQTT_HOSTS), so we don't call mqtt.setServer() here.
   mqtt.setBufferSize(768);
   mqtt.setCallback(onMqttMessage);
   ensureMqtt();
