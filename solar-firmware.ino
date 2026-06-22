@@ -1149,12 +1149,11 @@ void setup() {
   }
 
   if (inaPanel.begin()) {
-    // Panel is small (~1-5W, max ~300mA). 16V/400mA gives ~10 uA per LSB ->
-    // ~10x cleaner readings at low currents than the default 32V/2A, while
-    // still covering the panel's full Voc and Isc.
-    inaPanel.setCalibration_16V_400mA();
+    // Both INA219 use the library default 32V/2A range (set by begin()):
+    // it covers the panel's full Voc/Isc and the servo current spikes on the
+    // battery rail without clipping.
     inaOk = true;
-    Serial.println("[ina] panel OK (16V/400mA)");
+    Serial.println("[ina] panel OK (32V/2A)");
   } else {
     Serial.println("[ina] panel FAIL");
   }
