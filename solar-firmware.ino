@@ -1,82 +1,3 @@
-/*
- * LightTrack - ESP32 two-servo controller + 2x INA219 + OLED (MQTT)
- *
- * Telemetry units are SI: solar_voltage [V], solar_current [A], solar_power [W],
- * solar_energy_today_wh [Wh]. The OLED shows mA/mW locally for readability.
- *
- * Two INA219 sensors share the I2C bus:
- *   inaPanel   @ 0x40 -> solar panel side (default address)
- *   inaBattery @ BATTERY_INA_ADDRESS -> battery side (MUST differ from 0x40)
- *
- * The battery INA219 measures NET battery current (charge minus load on the
- * shared rail). charging_* and charged_energy_today_wh therefore represent NET
- * energy gained by the battery, not gross MPPT-delivered energy.
- *
- * AUTO tracking uses a proportional step: the correction applied per tick is
- * scaled by the LDR error magnitude and saturated at MAX_TRACK_STEP. This gives
- * fast convergence on large errors and fine motion near the optimum, while the
- * deadband prevents jitter. No integral/derivative term is used because the
- * servos already provide internal position control.
- *
- * Sky sweep policy: a full coarse scan runs whenever the panel TRANSITIONS
- * INTO AUTO from a different mode (boot/IDLE -> AUTO, MANUAL -> AUTO), and as
- * a fallback if AUTO sees darkness for too long during the DAY ("lost sun").
- * Lost-sun fallback is suppressed during astronomical night - there is no sun
- * to find below the horizon, so scanning would just burn through servos.
- * Re-entering AUTO when already in AUTO does NOT trigger a redundant scan.
- *
- * Night policy:
- *   - ENTRY: panel moves to HOME (90,90) and switches to NIGHT mode. The
- *     mode that was active before night is saved in modeBeforeNight.
- *   - EXIT (morning): mode is RESTORED to whatever was active before night.
- *       AUTO -> stays AUTO, panel pre-aims at today's sunrise azimuth so
- *               the LDR fine-tune immediately picks up the rising sun.
- *       MANUAL -> stays MANUAL, panel remains parked at HOME until the
- *               user sends a new MOVE_PANEL command.
- *       IDLE   -> stays IDLE, panel remains parked at HOME doing nothing.
- *     This preserves user intent across the night - if you chose MANUAL or
- *     IDLE in the afternoon, you keep that mode in the morning.
- *   - TELEMETRY: while in NIGHT the telemetry cadence drops from the 1s
- *     daytime rate to TELEMETRY_INTERVAL_NIGHT_MS (30s), since nothing is
- *     tracking and the values barely change - this cuts WiFi/MQTT traffic and
- *     radio power overnight. A REQUEST_STATUS command still forces an immediate
- *     publish, and any manual command exits NIGHT, restoring the 1s cadence for
- *     the duration of the manual-override window.
- *
- * Error policy:
- *   - ERROR is entered only on a catastrophic I2C bus failure at boot (no INA219
- *     and no OLED answering at all). Tracking itself uses ADC (LDRs) + PWM
- *     (servos) and does not need I2C, but with the whole sensing/display bus
- *     dead the system cannot monitor anything, so it refuses to run unattended.
- *   - A SINGLE missing I2C device is NOT an error: it is handled by graceful
- *     degradation (its fields are omitted from telemetry).
- *   - ERROR is sticky: recovery is by reboot after fixing the wiring.
- *
- * OLED: dual-color SSD1306 0.96" (yellow top 16 rows + white bottom 48 rows,
- * colors fixed by the panel hardware). The normal screen uses the yellow band
- * for the "-- PANEL --" header and the white band for V/I/P. When the panel
- * reaches a mechanical limit on either axis (AUTO, MANUAL, or rejected
- * out-of-range commands), the screen switches to a "!! WARNING !!" banner in
- * yellow with the axis/limit detail in white, for LIMIT_WARNING_MS, then
- * returns to normal. The warning fires once per ENTRY into the limit
- * (anti-spam) and re-arms when the panel leaves the limit.
- *
- * Cardinal azimuth convention (for documentation, not exposed to firmware):
- *   panel_azimuth = horizontal_angle + 90
- *   0°=E / 90°=S / 180°=W (i.e. servo 90° aims at true South).
- *   Sunrise azimuth math here uses 0=N, 90=E, 180=S, 270=W (compass),
- *   converted to servo via servo = cardinal - 90.
- *
- * Dependencies (Arduino IDE):
- *   ESP32 board package, ESP32Servo, PubSubClient, ArduinoJson 7.x,
- *   Adafruit INA219, U8g2, SunSet (buelowp) -> #include <sunset.h>, Preferences.
- *   (WiFiMulti ships with the ESP32 core - no extra install.)
- *
- * MQTT broker: the Pi has a different IP per network (home vs hotspot). Define
- * SECRET_MQTT_HOST and SECRET_MQTT_HOST_2 in secrets.h; the ESP tries each in
- * turn until one connects (see ensureMqtt).
- */
-
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <PubSubClient.h>
@@ -90,9 +11,7 @@
 #include <math.h>
 #include <sunset.h>
 #include "esp_task_wdt.h"
-#include "secrets.h"   // WiFi + MQTT credentials (NOT tracked in git)
-
-// =========================== Configuration ==================================
+#include "secrets.h"
 
 static const char*    WIFI_SSID     = SECRET_WIFI_SSID;
 static const char*    WIFI_PASSWORD = SECRET_WIFI_PASSWORD;
@@ -102,10 +21,6 @@ static const char*    MQTT_CLIENT_ID = SECRET_MQTT_CLIENT_ID;
 static const char*    MQTT_USERNAME  = SECRET_MQTT_USERNAME;
 static const char*    MQTT_PASSWORD  = SECRET_MQTT_PASSWORD;
 
-// MQTT broker candidates. The Pi gets a different IP on each network (home vs
-// hotspot), so the ESP tries each in turn until one connects. The second host
-// is optional: if SECRET_MQTT_HOST_2 is not defined in secrets.h, only the
-// first is used and the firmware still builds.
 static const char* MQTT_HOSTS[] = {
   SECRET_MQTT_HOST,
 #ifdef SECRET_MQTT_HOST_2
@@ -137,86 +52,48 @@ static const uint8_t V_MAX = 175;
 static const uint8_t H_HOME = 90;
 static const uint8_t V_HOME = 90;
 
-// Sunrise pre-aim elevation: panel low, close to where the sun is at horizon.
-// The LDR fine-tune will lift it as the sun climbs.
 static const uint8_t V_SUNRISE = 30;
 
-static const uint16_t MIN_STEP_DELAY_MS     = 35;   // smoother manual sweep
+static const uint16_t MIN_STEP_DELAY_MS     = 35;
 
-// Telemetry cadence: 1s while active (AUTO/MANUAL/IDLE during the day), and a
-// reduced 30s rate while in NIGHT mode (nothing is tracking, values are static,
-// so we save WiFi/MQTT traffic and radio power overnight). REQUEST_STATUS still
-// forces an immediate publish regardless of cadence.
 static const uint16_t TELEMETRY_INTERVAL_MS       = 1000;
 static const uint32_t TELEMETRY_INTERVAL_NIGHT_MS = 30000;
 
 static const uint8_t LDR_SAMPLES = 8;
 
-// ----- Tracking tuning (gentler still - peak ~20°/s in AUTO) -----
 static const int      LDR_DEADBAND      = 350;
-static const int      DARK_THRESHOLD    = 400;   // avg LDR below this -> no tracking/scan
-static const uint8_t  MAX_TRACK_STEP    = 2;     // max degrees per tracking tick
-static const int      PROP_STEP_DIVISOR = 500;  // larger -> gentler ramp to max
+static const int      DARK_THRESHOLD    = 400;
+static const uint8_t  MAX_TRACK_STEP    = 2;
+static const int      PROP_STEP_DIVISOR = 500;
 static const uint16_t TRACK_INTERVAL_MS = 50;
 static const uint16_t SAMPLE_INTERVAL_MS = 100;
 
-// ----- Coarse scan -----
-// 5° step + 90 ms settle: a smooth, near-continuous sweep (the 8°/200 ms
-// variant moved in big jerky steps and strained the servos). The scan runs as
-// coordinate descent (sweep azimuth, then elevation, repeated up to
-// SCAN_MAX_ROUNDS): one pass per axis cannot find the joint optimum of a point
-// source because the best azimuth depends on the current elevation and
-// vice-versa - a single azimuth-then-elevation sweep tends to slam elevation to
-// the limit. Each round is ~6-7 s, it stops early once a round changes nothing,
-// and it pets the watchdog itself (see sweepAxis), so its blocking duration does
-// not trip the WDT. Fine tracking (trackStep) corrects the small scan coarseness
-// within a few ticks.
 static const uint8_t  SCAN_STEP        = 5;
 static const uint16_t SCAN_SETTLE_MS   = 90;
 static const uint8_t  SCAN_LDR_SAMPLES = 4;
-// Coordinate-descent rounds (azimuth + elevation) before giving up; stops early
-// on convergence. One pass per axis is not enough for a point source.
+
 static const uint8_t  SCAN_MAX_ROUNDS  = 3;
-// In AUTO, stay this many degrees inside the hard limits so the scan and the
-// steady-state tracking never park exactly on 5°/175° and fire the limit warning
-// every cycle. Manual moves still use the full H_MIN..H_MAX range.
+
 static const uint8_t  AUTO_MARGIN_DEG  = 1;
 
-// "Lost sun" fallback: after this many consecutive AUTO ticks below
-// DARK_THRESHOLD (~10s at TRACK_INTERVAL_MS=100), request a fresh sweep.
-// updateLowLight() owns the longer night/idle transitions; this only
-// catches "panel pointed completely wrong after a manual move".
-// Suppressed at astronomical night - see trackStep().
 static const uint16_t LOST_SUN_TICKS = 100;
 
-// ----- Low-light handling -----
 static const int      LOW_LIGHT_THRESHOLD  = 650;
 static const uint32_t LOW_LIGHT_CONFIRM_MS = 5000;
 static const uint32_t DARK_TO_IDLE_MS      = 1800000;
 static const uint32_t MANUAL_OVERRIDE_MS   = 600000;
 static const uint32_t LIGHT_RESTORE_MS     = 5000;
 
-// ----- OLED limit warning -----
 static const uint32_t LIMIT_WARNING_MS = 5000;
 
-// ----- Hardware watchdog -----
-// If loop() doesn't pet the WDT within this window, the chip reboots. The
-// system is unattended outdoor, so silent hangs (I2C stuck, library deadlock,
-// etc.) must self-recover. 30s is far longer than the gap between watchdog pets
-// inside any blocking op (the coarse scan and manual sweeps pet the WDT every
-// step), and below any user's patience for a frozen dashboard. WiFi/MQTT
-// reconnect loops pet the WDT themselves so a missing router doesn't cause a
-// reboot storm.
 static const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
 
-// ----- Energy accumulation (Wh) -----
 static const uint32_t ENERGY_SAVE_INTERVAL_MS = 300000;
 static const char*    NVS_NAMESPACE           = "lighttrack";
 static const char*    NVS_KEY_ENERGY_WH       = "energyWh";
 static const char*    NVS_KEY_ENERGY_DAY      = "energyDay";
 static const char*    NVS_KEY_CHARGED_WH      = "chargedWh";
 
-// ----- Battery monitoring (second INA219) -----
 static const uint8_t BATTERY_INA_ADDRESS              = 0x41;
 static const uint8_t BATTERY_CELLS                    = 1;
 static const float   BATTERY_CURRENT_DEADBAND_MA      = 30.0f;
@@ -231,16 +108,13 @@ static const BatteryPoint BATTERY_CURVE[] = {
 };
 static const size_t BATTERY_CURVE_LEN = sizeof(BATTERY_CURVE) / sizeof(BATTERY_CURVE[0]);
 
-// ----- Location + time (for sunrise/sunset) -----
-static const double LOCATION_LAT = 45.75;   // Timisoara
+static const double LOCATION_LAT = 45.75;
 static const double LOCATION_LON = 21.23;
 static const char*  TZ_INFO = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 static const char*  NTP_SERVER = "pool.ntp.org";
 
-// Local PI - some toolchains do not expose M_PI by default.
 static constexpr double PI_D = 3.14159265358979323846;
 
-// =========================== Tracking mode ==================================
 enum class TrackingMode : uint8_t { AUTO, MANUAL, IDLE, NIGHT, ERROR };
 
 static const char* trackingModeStr(TrackingMode m) {
@@ -263,11 +137,9 @@ static bool parseTrackingMode(const char* s, TrackingMode& out) {
   return false;
 }
 
-// =========================== Globals ========================================
-
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
-WiFiMulti    wifiMulti;   // holds all known networks; picks the best available
+WiFiMulti    wifiMulti;
 
 Servo servoAzimuth;
 Servo servoElevation;
@@ -319,7 +191,6 @@ static bool     telemetryNowRequested = false;
 static bool     scanRequested        = false;
 static uint16_t lostSunTicks         = 0;
 
-// Anti-spam edge detectors for the OLED limit warning.
 static bool     wasAtHLimit          = false;
 static bool     wasAtVLimit          = false;
 
@@ -335,17 +206,13 @@ static uint32_t lastEnergyMs     = 0;
 static int      energyDay        = -1;
 static uint32_t lastEnergySaveMs = 0;
 
-// OLED limit warning state
 static uint32_t limitWarningUntilMs = 0;
 static char     limitWarningText[24] = "";
 
-// =========================== Forward declarations ===========================
 static void moveTo(uint8_t targetH, uint8_t targetV);
 static void preAimAtSunrise();
 static bool isAstronomicalNight();
-static void publishTelemetry();   // used by the scan to stream the moving panel
-
-// =========================== Helpers ========================================
+static void publishTelemetry();
 
 static uint8_t clampAngle(int value, uint8_t lo, uint8_t hi) {
   if (value < lo) return lo;
@@ -386,8 +253,6 @@ static void checkAxisLimits() {
   }
   wasAtVLimit = atVLimit;
 }
-
-// ----- Battery -----
 
 static int batteryPercentFromVoltage(float packVoltage) {
   const float cellV = packVoltage / BATTERY_CELLS;
@@ -488,15 +353,13 @@ static bool isAstronomicalNight() {
   return (nowMin < sunriseMin) || (nowMin > sunsetMin);
 }
 
-// =========================== Sunrise azimuth math ===========================
-
 static double sunriseAzimuthDeg() {
   if (!timeValid) return 90.0;
 
   time_t nowSec = time(nullptr);
   struct tm lt;
   localtime_r(&nowSec, &lt);
-  const int doy = lt.tm_yday + 1;  // tm_yday is 0..365; formula uses 1..365
+  const int doy = lt.tm_yday + 1;
 
   const double decl = 0.4093 * sin(2.0 * PI_D * (doy - 81) / 365.0);
   const double latRad = LOCATION_LAT * PI_D / 180.0;
@@ -505,7 +368,7 @@ static double sunriseAzimuthDeg() {
   if (cosA >  1.0) cosA =  1.0;
   if (cosA < -1.0) cosA = -1.0;
 
-  return acos(cosA) * 180.0 / PI_D;  // 0..180, measured from North
+  return acos(cosA) * 180.0 / PI_D;
 }
 
 static uint8_t cardinalToServoH(double cardinalDeg) {
@@ -521,8 +384,6 @@ static void preAimAtSunrise() {
                 targetH, targetV, azNorth);
   moveTo(targetH, targetV);
 }
-
-// =========================== Energy accumulation ============================
 
 static void loadEnergyFromNvs() {
   prefs.begin(NVS_NAMESPACE, false);
@@ -577,8 +438,6 @@ static void updateEnergy() {
   }
 }
 
-// =========================== Coarse scan ====================================
-
 static long readTotalLight() {
   long total = 0;
   for (uint8_t i = 0; i < SCAN_LDR_SAMPLES; i++) {
@@ -590,26 +449,18 @@ static long readTotalLight() {
   return total / SCAN_LDR_SAMPLES;
 }
 
-// Sweep one axis over [lo, hi] in SCAN_STEP steps (the other axis is left where
-// it is) and return the angle with the most total light. The panel does NOT
-// stop when it passes the brightest spot - it sweeps the whole range so it finds
-// the GLOBAL maximum (not the first local peak / a reflection), and the caller
-// writes the servo back to that best angle afterwards. Pets the WDT every step
-// so a multi-round scan cannot trip the 30s watchdog. While sweeping it reflects
-// the live angle into `liveAngle` and streams throttled telemetry (~5x/s) so the
-// dashboard shows the mode and the panel moving DURING the scan, not only after.
 static uint8_t sweepAxis(Servo& servo, uint8_t& liveAngle, int lo, int hi) {
   uint8_t best = static_cast<uint8_t>(lo);
   long bestLight = -1;
   static uint32_t lastScanPubMs = 0;
   for (int a = lo; a <= hi; a += SCAN_STEP) {
     servo.write(a);
-    liveAngle = static_cast<uint8_t>(a);    // reflect the moving panel in telemetry
+    liveAngle = static_cast<uint8_t>(a);
     delay(SCAN_SETTLE_MS);
     esp_task_wdt_reset();
-    mqtt.loop();                            // keep MQTT alive during the long scan
+    mqtt.loop();
     const uint32_t pubNow = millis();
-    if (pubNow - lastScanPubMs >= 200) {    // stream ~5x/s, not on every step
+    if (pubNow - lastScanPubMs >= 200) {
       lastScanPubMs = pubNow;
       publishTelemetry();
     }
@@ -628,13 +479,6 @@ static void performScan() {
   uint8_t bestH = clampAngle(state.horizontalAngle, hLo, hHi);
   uint8_t bestV = clampAngle(state.verticalAngle, vLo, vHi);
 
-  // Coordinate descent: alternately optimise azimuth and elevation until neither
-  // axis moves (the joint maximum) or we run out of rounds. One pass per axis
-  // lands on the wrong spot for a point source because the axes are coupled - the
-  // best azimuth depends on the current elevation and vice-versa, which is why a
-  // single azimuth-then-elevation sweep tends to slam elevation to the limit.
-  // state.horizontalAngle / state.verticalAngle are passed as the live angle so
-  // the streamed telemetry follows the panel during the sweep.
   for (uint8_t round = 0; round < SCAN_MAX_ROUNDS; round++) {
     servoElevation.write(bestV);
     state.verticalAngle = bestV;
@@ -662,10 +506,8 @@ static void performScan() {
   Serial.print(" V="); Serial.println(bestV);
 }
 
-// =========================== Low-light state machine ========================
-
 static void updateLowLight() {
-  if (state.mode == TrackingMode::ERROR) return;   // [ERROR] sticky until reboot
+  if (state.mode == TrackingMode::ERROR) return;
 
   const uint32_t now = millis();
   const bool lowLight = isLowLightMajority();
@@ -675,7 +517,6 @@ static void updateLowLight() {
     if (!lowLight) {
       if (lightOkSinceMs == 0) lightOkSinceMs = now;
       if (now - lightOkSinceMs >= LIGHT_RESTORE_MS) {
-        // Morning wake: restore the mode that was active before night.
         isNight = false;
         state.mode = modeBeforeNight;
         scanRequested = false;
@@ -718,8 +559,6 @@ static void updateLowLight() {
   }
 }
 
-// =========================== AUTO tracking ==================================
-
 static void trackStep() {
   if (state.mode != TrackingMode::AUTO) return;
 
@@ -727,10 +566,10 @@ static void trackStep() {
     if (averageLight() >= DARK_THRESHOLD) {
       scanRequested = false;
       state.isMoving = true;
-      publishTelemetry();   // push mode=AUTO + isMoving instantly, before the long scan
+      publishTelemetry();
       performScan();
       state.isMoving = false;
-      publishTelemetry();   // show the final settled position immediately
+      publishTelemetry();
       lastTrackMs = millis();
       lostSunTicks = 0;
       checkAxisLimits();
@@ -779,8 +618,6 @@ static void trackStep() {
   checkAxisLimits();
 }
 
-// =========================== OLED ===========================================
-
 static void oledShow() {
   if (!oledOk) return;
   oled.clearBuffer();
@@ -813,8 +650,6 @@ static void oledShow() {
   oled.sendBuffer();
 }
 
-// =========================== Movement (command-driven) ======================
-
 static void moveTo(uint8_t targetH, uint8_t targetV) {
   targetH = clampAngle(targetH, H_MIN, H_MAX);
   targetV = clampAngle(targetV, V_MIN, V_MAX);
@@ -837,14 +672,12 @@ static void moveTo(uint8_t targetH, uint8_t targetV) {
       servoElevation.write(state.verticalAngle);
     }
     delay(MIN_STEP_DELAY_MS);
-    esp_task_wdt_reset();   // pet WDT during long manual sweeps
+    esp_task_wdt_reset();
   }
 
   state.isMoving = false;
   checkAxisLimits();
 }
-
-// =========================== ACK publishing =================================
 
 static void publishAck(const char* commandId,
                        const char* status,
@@ -862,8 +695,6 @@ static void publishAck(const char* commandId,
   const size_t len = serializeJson(doc, buf, sizeof(buf));
   mqtt.publish(TOPIC_ACK, reinterpret_cast<uint8_t*>(buf), len, false);
 }
-
-// =========================== Command dispatch ===============================
 
 static bool handleMovePanel(const char* commandId, JsonVariantConst payload) {
   if (!payload["h_angle"].is<int>() || !payload["v_angle"].is<int>()) {
@@ -961,7 +792,6 @@ static void handleCommand(const JsonDocument& doc) {
     return;
   }
 
-  // [ERROR] In ERROR the device refuses everything except a status query.
   if (state.mode == TrackingMode::ERROR &&
       strcmp(commandType, "REQUEST_STATUS") != 0) {
     publishAck(commandId, "FAILED", "device in ERROR (I2C unavailable)");
@@ -987,8 +817,6 @@ static void handleCommand(const JsonDocument& doc) {
   }
 }
 
-// =========================== MQTT callback ==================================
-
 static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
   if (strcmp(topic, TOPIC_COMMANDS) != 0) return;
 
@@ -1001,8 +829,6 @@ static void onMqttMessage(char* topic, uint8_t* payload, unsigned int len) {
   }
   handleCommand(doc);
 }
-
-// =========================== Telemetry ======================================
 
 static void publishTelemetry() {
   StaticJsonDocument<768> doc;
@@ -1044,18 +870,11 @@ static void publishTelemetry() {
   mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<uint8_t*>(buf), n, false);
 }
 
-// =========================== Connection / time ==============================
-
-// Multi-AP WiFi: tries every registered network (home + hotspot) and joins the
-// known one with the strongest signal that is currently in range. If the active
-// AP later disappears, loop() calls this again and it fails over to the other.
-// addAP() registration happens once in setup(), not here, so reconnects don't
-// pile up duplicate entries.
 static void connectWifi() {
   WiFi.mode(WIFI_STA);
   Serial.println("[wifi] connecting (multi-AP)...");
   while (wifiMulti.run() != WL_CONNECTED) {
-    esp_task_wdt_reset();  // avoid WDT trip while scanning/joining
+    esp_task_wdt_reset();
     delay(500);
     Serial.print(".");
   }
@@ -1079,14 +898,10 @@ static void refreshTimeValid() {
   }
 }
 
-// Try each broker in MQTT_HOSTS in turn until one connects. The Pi has a
-// different IP per network (home vs hotspot), so alternating between the known
-// IPs lets the ESP find the broker on whichever network it joined. hostIdx is
-// static so a later reconnect keeps trying from where it left off.
 static void ensureMqtt() {
   static size_t hostIdx = 0;
   while (!mqtt.connected()) {
-    esp_task_wdt_reset();  // avoid WDT trip while broker is offline
+    esp_task_wdt_reset();
     const char* host = MQTT_HOSTS[hostIdx];
     mqtt.setServer(host, MQTT_PORT);
     Serial.printf("[mqtt] connecting to %s:%u\n", host, MQTT_PORT);
@@ -1095,37 +910,29 @@ static void ensureMqtt() {
       mqtt.subscribe(TOPIC_COMMANDS, 1);
     } else {
       Serial.printf("[mqtt] failed (rc=%d), trying next broker in 2s\n", mqtt.state());
-      hostIdx = (hostIdx + 1) % MQTT_HOST_COUNT;  // alternate home <-> hotspot
+      hostIdx = (hostIdx + 1) % MQTT_HOST_COUNT;
       delay(2000);
     }
   }
 }
 
-// =========================== Arduino entry points ===========================
-
 void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // Report why we last reset (BROWNOUT vs WATCHDOG vs PANIC) - useful for
-  // field debugging power vs firmware issues.
   esp_reset_reason_t rr = esp_reset_reason();
   Serial.printf("[boot] reset reason = %s\n",
     rr == ESP_RST_BROWNOUT ? "BROWNOUT" :
     (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT) ? "WATCHDOG" :
     rr == ESP_RST_PANIC ? "PANIC/CRASH" : "other");
 
-  // Hardware watchdog: the Arduino core already starts a Task WDT on loopTask,
-  // so esp_task_wdt_init() would fail with "already initialized". We reconfigure
-  // it to our timeout instead. Long blocking ops (performScan, moveTo, WiFi/MQTT
-  // reconnect) pet the WDT themselves so they don't trip it.
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms     = WATCHDOG_TIMEOUT_MS,
     .idle_core_mask = 0,
     .trigger_panic  = true,
   };
-  esp_task_wdt_reconfigure(&wdt_config);  // apply our 30s window to the core's TWDT
-  esp_task_wdt_add(NULL);                 // ensure loopTask is watched (no-op if already)
+  esp_task_wdt_reconfigure(&wdt_config);
+  esp_task_wdt_add(NULL);
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
@@ -1149,9 +956,6 @@ void setup() {
   }
 
   if (inaPanel.begin()) {
-    // Both INA219 use the library default 32V/2A range (set by begin()):
-    // it covers the panel's full Voc/Isc and the servo current spikes on the
-    // battery rail without clipping.
     inaOk = true;
     Serial.println("[ina] panel OK (32V/2A)");
   } else {
@@ -1159,19 +963,12 @@ void setup() {
   }
 
   if (inaBattery.begin()) {
-    // Battery rail sees servo stall currents, so keep the default 32V/2A
-    // calibration to avoid clipping during transients.
     inaBatteryOk = true;
     Serial.printf("[ina] battery OK (0x%02X, 32V/2A)\n", BATTERY_INA_ADDRESS);
   } else {
     Serial.printf("[ina] battery FAIL (no device at 0x%02X)\n", BATTERY_INA_ADDRESS);
   }
 
-  // [ERROR] Catastrophic I2C bus failure: if NOT A SINGLE I2C device answered
-  // (both INA219 and the OLED), the bus is dead/unwired - nothing to measure,
-  // nothing to show. Enter the reserved ERROR state and refuse to run
-  // unattended. A SINGLE missing device is handled by graceful degradation
-  // (its fields are simply omitted from telemetry), not by ERROR.
   if (!inaOk && !inaBatteryOk && !oledOk) {
     state.mode = TrackingMode::ERROR;
     Serial.println("[boot] I2C bus dead (no devices) -> ERROR");
@@ -1192,9 +989,6 @@ void setup() {
 
   sun.setPosition(LOCATION_LAT, LOCATION_LON, 2);
 
-  // Register every known network ONCE. wifiMulti then joins whichever is in
-  // range with the best signal. The second AP (hotspot) is optional: if it's
-  // not defined in secrets.h the firmware still builds and uses only the first.
   wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
 #ifdef SECRET_WIFI_SSID_2
   wifiMulti.addAP(SECRET_WIFI_SSID_2, SECRET_WIFI_PASSWORD_2);
@@ -1203,15 +997,13 @@ void setup() {
   connectWifi();
   startTimeSync();
 
-  // The broker host is selected per-attempt inside ensureMqtt() (it cycles
-  // through MQTT_HOSTS), so we don't call mqtt.setServer() here.
   mqtt.setBufferSize(768);
   mqtt.setCallback(onMqttMessage);
   ensureMqtt();
 }
 
 void loop() {
-  esp_task_wdt_reset();  // pet the watchdog: "still alive"
+  esp_task_wdt_reset();
 
   if (WiFi.status() != WL_CONNECTED) connectWifi();
   if (!mqtt.connected())            ensureMqtt();
