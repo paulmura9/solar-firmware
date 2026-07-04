@@ -32,6 +32,7 @@ static const size_t MQTT_HOST_COUNT = sizeof(MQTT_HOSTS) / sizeof(MQTT_HOSTS[0])
 static const char* TOPIC_TELEMETRY = "solar/telemetry";
 static const char* TOPIC_COMMANDS  = "solar/commands";
 static const char* TOPIC_ACK       = "solar/commands/ack";
+static const char* TOPIC_EVENTS    = "solar/events";
 
 static const uint8_t PIN_SERVO_AZIMUTH   = 18;
 static const uint8_t PIN_SERVO_ELEVATION = 19;
@@ -87,6 +88,12 @@ static const uint32_t LIGHT_RESTORE_MS     = 5000;
 static const uint32_t LIMIT_WARNING_MS = 5000;
 
 static const uint32_t WATCHDOG_TIMEOUT_MS = 30000;
+
+static const uint32_t BOOT_CONNECT_BUDGET_MS = 45000;
+static const uint32_t OFFLINE_AUTO_AFTER_MS  = 60000;
+static const uint32_t RECONNECT_EVERY_MS     = 20000;
+static const uint32_t WIFI_TRY_MS            = 3000;
+static const uint32_t MQTT_TRY_MS            = 4000;
 
 static const uint32_t ENERGY_SAVE_INTERVAL_MS = 300000;
 static const char*    NVS_NAMESPACE           = "lighttrack";
@@ -209,10 +216,15 @@ static uint32_t lastEnergySaveMs = 0;
 static uint32_t limitWarningUntilMs = 0;
 static char     limitWarningText[24] = "";
 
+static uint32_t offlineSinceMs     = 0;
+static uint32_t lastReconnectTryMs = 0;
+static bool     offlineAutoApplied = false;
+
 static void moveTo(uint8_t targetH, uint8_t targetV);
 static void preAimAtSunrise();
 static bool isAstronomicalNight();
 static void publishTelemetry();
+static void publishEvent(const char* eventType, const char* severity, const char* message);
 
 static uint8_t clampAngle(int value, uint8_t lo, uint8_t hi) {
   if (value < lo) return lo;
@@ -238,6 +250,7 @@ static void triggerLimitWarning(const char* text) {
   strncpy(limitWarningText, text, sizeof(limitWarningText) - 1);
   limitWarningText[sizeof(limitWarningText) - 1] = '\0';
   limitWarningUntilMs = millis() + LIMIT_WARNING_MS;
+  publishEvent("LIMIT_REACHED", "WARNING", text);
 }
 
 static void checkAxisLimits() {
@@ -696,6 +709,18 @@ static void publishAck(const char* commandId,
   mqtt.publish(TOPIC_ACK, reinterpret_cast<uint8_t*>(buf), len, false);
 }
 
+static void publishEvent(const char* eventType, const char* severity, const char* message) {
+  StaticJsonDocument<256> doc;
+  doc["event_type"] = eventType;
+  doc["severity"]   = severity;
+  doc["message"]    = message;
+  doc["device_id"]  = MQTT_CLIENT_ID;
+
+  char buf[256];
+  const size_t n = serializeJson(doc, buf, sizeof(buf));
+  mqtt.publish(TOPIC_EVENTS, reinterpret_cast<uint8_t*>(buf), n, false);
+}
+
 static bool handleMovePanel(const char* commandId, JsonVariantConst payload) {
   if (!payload["h_angle"].is<int>() || !payload["v_angle"].is<int>()) {
     publishAck(commandId, "FAILED", "missing h_angle or v_angle");
@@ -870,16 +895,20 @@ static void publishTelemetry() {
   mqtt.publish(TOPIC_TELEMETRY, reinterpret_cast<uint8_t*>(buf), n, false);
 }
 
-static void connectWifi() {
+static bool connectWifiBounded(uint32_t budgetMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
   WiFi.mode(WIFI_STA);
   Serial.println("[wifi] connecting (multi-AP)...");
+  const uint32_t start = millis();
   while (wifiMulti.run() != WL_CONNECTED) {
     esp_task_wdt_reset();
-    delay(500);
+    if (millis() - start >= budgetMs) return false;
+    delay(200);
     Serial.print(".");
   }
   Serial.printf("\n[wifi] connected to \"%s\", ip=%s, rssi=%d dBm\n",
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  return true;
 }
 
 static void startTimeSync() {
@@ -898,21 +927,62 @@ static void refreshTimeValid() {
   }
 }
 
-static void ensureMqtt() {
+static bool ensureMqttBounded(uint32_t budgetMs) {
   static size_t hostIdx = 0;
+  const uint32_t start = millis();
   while (!mqtt.connected()) {
     esp_task_wdt_reset();
+    if (WiFi.status() != WL_CONNECTED) return false;
     const char* host = MQTT_HOSTS[hostIdx];
     mqtt.setServer(host, MQTT_PORT);
     Serial.printf("[mqtt] connecting to %s:%u\n", host, MQTT_PORT);
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
       Serial.printf("[mqtt] connected to %s\n", host);
       mqtt.subscribe(TOPIC_COMMANDS, 1);
-    } else {
-      Serial.printf("[mqtt] failed (rc=%d), trying next broker in 2s\n", mqtt.state());
-      hostIdx = (hostIdx + 1) % MQTT_HOST_COUNT;
-      delay(2000);
+      return true;
     }
+    Serial.printf("[mqtt] failed (rc=%d)\n", mqtt.state());
+    hostIdx = (hostIdx + 1) % MQTT_HOST_COUNT;
+    if (millis() - start >= budgetMs) return false;
+    delay(500);
+  }
+  return true;
+}
+
+static void enterOfflineAuto() {
+  if (offlineAutoApplied) return;
+  offlineAutoApplied = true;
+  if (state.mode != TrackingMode::AUTO && state.mode != TrackingMode::ERROR) {
+    state.mode = TrackingMode::AUTO;
+    isNight = false;
+    scanRequested = true;
+    Serial.println("[net] offline fallback -> AUTO");
+  }
+}
+
+static void serviceConnectivity() {
+  const uint32_t now = millis();
+
+  if (!mqtt.connected()) {
+    if (offlineSinceMs == 0) offlineSinceMs = now;
+
+    if (now - lastReconnectTryMs >= RECONNECT_EVERY_MS) {
+      lastReconnectTryMs = now;
+      if (WiFi.status() != WL_CONNECTED) connectWifiBounded(WIFI_TRY_MS);
+      if (WiFi.status() == WL_CONNECTED) ensureMqttBounded(MQTT_TRY_MS);
+    }
+
+    if (!mqtt.connected()) {
+      if (now - offlineSinceMs >= OFFLINE_AUTO_AFTER_MS) enterOfflineAuto();
+      return;
+    }
+  }
+
+  if (offlineSinceMs != 0) {
+    Serial.println("[net] link restored");
+    offlineSinceMs     = 0;
+    offlineAutoApplied = false;
+    if (!timeValid) startTimeSync();
   }
 }
 
@@ -994,19 +1064,24 @@ void setup() {
   wifiMulti.addAP(SECRET_WIFI_SSID_2, SECRET_WIFI_PASSWORD_2);
 #endif
 
-  connectWifi();
+  connectWifiBounded(BOOT_CONNECT_BUDGET_MS);
   startTimeSync();
 
   mqtt.setBufferSize(768);
   mqtt.setCallback(onMqttMessage);
-  ensureMqtt();
+  mqtt.setSocketTimeout(3);
+  if (WiFi.status() == WL_CONNECTED) ensureMqttBounded(BOOT_CONNECT_BUDGET_MS);
+
+  if (!mqtt.connected()) {
+    offlineSinceMs = millis();
+    enterOfflineAuto();
+  }
 }
 
 void loop() {
   esp_task_wdt_reset();
 
-  if (WiFi.status() != WL_CONNECTED) connectWifi();
-  if (!mqtt.connected())            ensureMqtt();
+  serviceConnectivity();
   mqtt.loop();
 
   refreshTimeValid();
